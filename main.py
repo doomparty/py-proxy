@@ -2,110 +2,104 @@ import os
 import stat
 import asyncio
 import socket
+import sys
 from aiohttp import web
 from aiohttp import ClientSession
 
-# --- 功能：实时监控日志文件 (Tail -f) ---
-async def monitor_log_file(filepath):
-    print(f"[LogMonitor] Waiting for {filepath} generation...")
-    
-    # 等待日志文件被创建
-    retries = 0
-    while not os.path.exists(filepath):
-        await asyncio.sleep(0.5)
-        retries += 1
-        if retries > 20: # 等待10秒还没文件说明启动失败了
-            print(f"[LogMonitor] Error: Log file {filepath} was not created.")
-            return
+# --- 核心修改：直接将子进程日志打印到标准输出 (STDOUT) ---
+async def log_pipe(stream, prefix):
+    """
+    读取子进程的输出流，并直接 print 到控制台，
+    这样容器平台的日志系统才能抓取到。
+    """
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        # 解码并去除末尾换行符
+        msg = line.decode('utf-8', errors='replace').strip()
+        if msg:
+            # flush=True 是关键，确保日志立即显示，不要缓存
+            print(f"[{prefix}] {msg}", flush=True)
 
-    print(f"[LogMonitor] Tailing {filepath}...")
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-            while True:
-                line = f.readline()
-                if line:
-                    # 打印到 Docker 控制台 (带前缀方便区分)
-                    print(f"[VSFTPD] {line.strip()}")
-                else:
-                    # 读到末尾，暂停一下等待新日志写入
-                    await asyncio.sleep(0.5)
-    except Exception as e:
-        print(f"[LogMonitor] Error reading log: {e}")
-
-# --- 功能：检查端口连通性 ---
+# --- 端口检查 ---
 async def check_port(port):
-    print(f"[System] Waiting for port {port}...")
-    for i in range(30): # 尝试 30 次 (30秒)
+    print(f"[System] Waiting for port {port} to open...", flush=True)
+    for i in range(30):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
             result = sock.connect_ex(('127.0.0.1', port))
             sock.close()
             if result == 0:
-                print(f"[System] SUCCESS: Port {port} is OPEN! Service is ready.")
+                print(f"[System] SUCCESS: Port {port} is OPEN! Service is ready.", flush=True)
                 return True
         except:
             pass
         await asyncio.sleep(1)
-    print(f"[System] WARNING: Port {port} did not open after 30 seconds.")
+    print(f"[System] WARNING: Port {port} did not open after 30s.", flush=True)
     return False
 
-# --- 核心任务：启动 vsftpd ---
+# --- 启动服务 ---
 async def run_vsftpd_service(app):
     bin_name = 'vsftpd'
     conf_name = 'config.json'
-    log_file = 'vsftpd.log'
     
-    print(f"[System] Initializing service...")
+    print(f"[System] Initializing service on Container Platform...", flush=True)
 
-    # 1. 确保文件存在
     if not os.path.exists(bin_name):
-        print(f"[System] ERROR: {bin_name} not found. Did you COPY it in Dockerfile?")
+        print(f"[System] CRITICAL: {bin_name} not found!", flush=True)
         return
 
-    # 2. 赋予可执行权限 (chmod +x)
+    # 1. 赋予权限
     try:
         st = os.stat(bin_name)
         os.chmod(bin_name, st.st_mode | stat.S_IEXEC)
-        print(f"[System] Granted executable permissions to ./{bin_name}")
+        print(f"[System] Permission granted to ./{bin_name}", flush=True)
     except Exception as e:
-        print(f"[System] Failed to chmod: {e}")
+        print(f"[System] chmod failed: {e}", flush=True)
 
-    # 3. 构造启动命令
-    # 格式：./vsftpd run -c ./config.json > vsftpd.log 2>&1
-    cmd = f"./{bin_name} run -c ./{conf_name} > {log_file} 2>&1"
+    # 2. 启动进程 (使用 PIPE 而不是重定向到文件)
+    # 假设你的 config.json 里配置的是 44345 端口
+    cmd_args = ["run", "-c", f"./{conf_name}"]
     
-    print(f"[System] Executing: {cmd}")
-    
-    # 4. 启动日志监控 (异步)
-    asyncio.create_task(monitor_log_file(log_file))
+    print(f"[System] Executing: ./{bin_name} {' '.join(cmd_args)}", flush=True)
 
     try:
-        # 5. 执行命令 (异步非阻塞)
-        process = await asyncio.create_subprocess_shell(cmd)
-        print(f"[System] Process launched with PID: {process.pid}")
+        # 使用 exec 配合 PIPE，不要用 shell=True，这样更稳定
+        process = await asyncio.create_subprocess_exec(
+            f"./{bin_name}",
+            *cmd_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        print(f"[System] Process started with PID: {process.pid}", flush=True)
         
-        # 6. 开始检查端口 (假设 config.json 里配的是 44520)
-        asyncio.create_task(check_port(44520))
+        # 3. 启动日志转发任务 (把 xray 的日志打到控制台)
+        asyncio.create_task(log_pipe(process.stdout, "VSFTPD-OUT"))
+        asyncio.create_task(log_pipe(process.stderr, "VSFTPD-ERR"))
+        
+        # 4. 检查端口
+        asyncio.create_task(check_port(44345))
 
     except Exception as e:
-        print(f"[System] Failed to launch process: {e}")
+        print(f"[System] Failed to launch process: {e}", flush=True)
 
-# --- 代理服务逻辑 (保持原样) ---
+# --- 代理逻辑 ---
 async def proxy_handler(request):
     if request.path == '/':
-        return web.Response(text='Hello World')
+        return web.Response(text='App is Running')
 
-    target_url = f'http://127.0.0.1:44520{request.path}'
+    target_url = f'http://127.0.0.1:44345{request.path}'
     
-    # WebSocket 代理
+    # WebSocket
     if request.headers.get('upgrade', '').lower() == 'websocket':
         ws_client = web.WebSocketResponse()
         await ws_client.prepare(request)
         try:
             async with ClientSession() as session:
                 async with session.ws_connect(
-                    f'ws://127.0.0.1:44520{request.path}',
+                    f'ws://127.0.0.1:44345{request.path}',
                     headers=dict(request.headers)
                 ) as ws_server:
                     await asyncio.gather(
@@ -117,7 +111,7 @@ async def proxy_handler(request):
             pass
         return ws_client
 
-    # HTTP 代理
+    # HTTP
     try:
         async with ClientSession() as session:
             data = await request.read()
@@ -134,7 +128,8 @@ async def proxy_handler(request):
                     headers.pop(h, None)
                 return web.Response(body=body, status=response.status, headers=headers)
     except Exception as e:
-        return web.Response(text=f"Proxy Error: {e}", status=502)
+        print(f"[ProxyError] {e}", flush=True)
+        return web.Response(text=f"Proxy Error", status=502)
 
 async def _ws_forward(src, dst):
     async for msg in src:
@@ -152,4 +147,7 @@ async def init_app():
     return app
 
 if __name__ == '__main__':
-    web.run_app(init_app(), port=3000)
+    # 适配平台动态端口，如果没有环境变量则默认 3000
+    port = int(os.environ.get('PORT', 3000))
+    print(f"[Init] Starting web server on port {port}...", flush=True)
+    web.run_app(init_app(), port=port)
