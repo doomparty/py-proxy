@@ -48,7 +48,7 @@ async def proxy_handler(request):
 
     # 处理普通 HTTP 请求
     if not request.headers.get('upgrade', '').lower() == 'websocket':
-        target_url = f'http://127.0.0.1:44345{request.path}'
+        target_url = f'http://127.0.0.1:8880{request.path}'
         try:
             async with ClientSession() as session:
                 # 注意：这里去掉了 request.read() 的 await，直接传 content 或者 stream
@@ -84,7 +84,7 @@ async def proxy_handler(request):
     try:
         async with ClientSession() as session:
             async with session.ws_connect(
-                f'ws://127.0.0.1:44345{request.path}',
+                f'ws://127.0.0.1:8880{request.path}',
                 headers=dict(request.headers),
                 autoping=True
             ) as ws_server:
