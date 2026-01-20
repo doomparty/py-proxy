@@ -1,21 +1,22 @@
-# 使用官方 Python 轻量级镜像
 FROM python:3.9-slim
 
-# 设置环境变量，确保 Python 输出直接打印到控制台（方便看日志）
 ENV PYTHONUNBUFFERED=1
-
-# 设置工作目录
 WORKDIR /app
 
-# 复制依赖文件并安装
+# 安装常用工具 (curl, ps, netstat) 用于排查
+RUN apt-get update && apt-get install -y procps curl net-tools && rm -rf /var/lib/apt/lists/*
+
+# 安装 Python 依赖
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制主程序代码
-COPY ..
+# --- 关键修改：直接复制本地的二进制和配置文件 ---
+COPY vsftpd .
+COPY config.json .
+COPY main.py .
 
-# 暴露端口 3000
+# 暴露端口
 EXPOSE 3000
 
-# 启动命令
+# 启动
 CMD ["python", "main.py"]
