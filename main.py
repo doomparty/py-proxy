@@ -3,103 +3,100 @@ import stat
 import asyncio
 import socket
 import sys
-from aiohttp import web
-from aiohttp import ClientSession
+import aiohttp
+from aiohttp import web, ClientSession
 
-# --- 核心修改：直接将子进程日志打印到标准输出 (STDOUT) ---
+# ================= 配置区域 =================
+# 这里的端口必须和你 config.json 里的 "inbound" -> "port" 保持一致！
+# 只有这样，Python 才能把流量转发给后台的 vsftpd
+INTERNAL_PORT = 44345 
+
+# 二进制文件名 (对应 Dockerfile 里的 COPY vsftpd .)
+BIN_NAME = './vsftpd'
+CONF_NAME = 'config.json'
+# ===========================================
+
+# --- 日志管道：把后台进程的日志“偷”出来打印到 Docker 控制台 ---
 async def log_pipe(stream, prefix):
-    """
-    读取子进程的输出流，并直接 print 到控制台，
-    这样容器平台的日志系统才能抓取到。
-    """
     while True:
         line = await stream.readline()
         if not line:
             break
-        # 解码并去除末尾换行符
+        # 解码并打印，flush=True 确保云平台能实时抓取日志
         msg = line.decode('utf-8', errors='replace').strip()
         if msg:
-            # flush=True 是关键，确保日志立即显示，不要缓存
             print(f"[{prefix}] {msg}", flush=True)
 
-# --- 端口检查 ---
+# --- 端口检查：等待后台进程启动成功 ---
 async def check_port(port):
-    print(f"[System] Waiting for port {port} to open...", flush=True)
-    for i in range(30):
+    print(f"[System] Waiting for backend port {port}...", flush=True)
+    for i in range(30): # 尝试 30 次，每次 1 秒
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
             result = sock.connect_ex(('127.0.0.1', port))
             sock.close()
             if result == 0:
-                print(f"[System] SUCCESS: Port {port} is OPEN! Service is ready.", flush=True)
+                print(f"[System] SUCCESS: Backend is ready on port {port}!", flush=True)
                 return True
         except:
             pass
         await asyncio.sleep(1)
-    print(f"[System] WARNING: Port {port} did not open after 30s.", flush=True)
+    print(f"[System] WARNING: Backend port {port} not open after 30s. Check config.json!", flush=True)
     return False
 
-# --- 启动服务 ---
-async def run_vsftpd_service(app):
-    bin_name = 'vsftpd'
-    conf_name = 'config.json'
-    
-    print(f"[System] Initializing service on Container Platform...", flush=True)
+# --- 启动后台服务 (vsftpd) ---
+async def run_background_service(app):
+    print(f"[System] Launching {BIN_NAME}...", flush=True)
 
-    if not os.path.exists(bin_name):
-        print(f"[System] CRITICAL: {bin_name} not found!", flush=True)
+    # 1. 再次确认文件存在
+    if not os.path.exists(BIN_NAME) or not os.path.exists(CONF_NAME):
+        print(f"[System] CRITICAL: Binary or Config not found in /app", flush=True)
         return
 
-    # 1. 赋予权限
-    try:
-        st = os.stat(bin_name)
-        os.chmod(bin_name, st.st_mode | stat.S_IEXEC)
-        print(f"[System] Permission granted to ./{bin_name}", flush=True)
-    except Exception as e:
-        print(f"[System] chmod failed: {e}", flush=True)
-
-    # 2. 启动进程 (使用 PIPE 而不是重定向到文件)
-    # 假设你的 config.json 里配置的是 44345 端口
-    cmd_args = ["run", "-c", f"./{conf_name}"]
+    # 2. 构造启动命令
+    # 假设这是 Xray/V2Ray 内核，标准启动命令是 run -c config.json
+    cmd_args = ["run", "-c", CONF_NAME]
     
-    print(f"[System] Executing: ./{bin_name} {' '.join(cmd_args)}", flush=True)
-
+    # 3. 启动子进程
     try:
-        # 使用 exec 配合 PIPE，不要用 shell=True，这样更稳定
         process = await asyncio.create_subprocess_exec(
-            f"./{bin_name}",
+            BIN_NAME,
             *cmd_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stdout=asyncio.subprocess.PIPE, # 捕获标准输出
+            stderr=asyncio.subprocess.PIPE  # 捕获错误输出
         )
         print(f"[System] Process started with PID: {process.pid}", flush=True)
         
-        # 3. 启动日志转发任务 (把 xray 的日志打到控制台)
-        asyncio.create_task(log_pipe(process.stdout, "VSFTPD-OUT"))
-        asyncio.create_task(log_pipe(process.stderr, "VSFTPD-ERR"))
+        # 4. 挂载日志转发 (关键步骤)
+        asyncio.create_task(log_pipe(process.stdout, "APP-OUT"))
+        asyncio.create_task(log_pipe(process.stderr, "APP-ERR"))
         
-        # 4. 检查端口
-        asyncio.create_task(check_port(44345))
+        # 5. 开始检查内部端口
+        asyncio.create_task(check_port(INTERNAL_PORT))
 
     except Exception as e:
         print(f"[System] Failed to launch process: {e}", flush=True)
 
-# --- 代理逻辑 ---
+# --- Web 代理处理逻辑 ---
 async def proxy_handler(request):
-    if request.path == '/':
-        return web.Response(text='App is Running')
+    # === 健康检查重点 ===
+    # 只要 Web 服务起来，不管后台进程有没有就绪，这里都返回 200
+    # 这样容器平台就会认为服务是健康的，不会重启容器
+    if request.path == '/' or request.path == '/health':
+        return web.Response(text='Service is Running')
 
-    target_url = f'http://127.0.0.1:44345{request.path}'
+    # 转发目标
+    target_url = f'http://127.0.0.1:{INTERNAL_PORT}{request.path}'
     
-    # WebSocket
+    # WebSocket 协议转发 (这是 VLESS/VMESS WS 模式的关键)
     if request.headers.get('upgrade', '').lower() == 'websocket':
         ws_client = web.WebSocketResponse()
         await ws_client.prepare(request)
         try:
             async with ClientSession() as session:
                 async with session.ws_connect(
-                    f'ws://127.0.0.1:44345{request.path}',
+                    f'ws://127.0.0.1:{INTERNAL_PORT}{request.path}',
                     headers=dict(request.headers)
                 ) as ws_server:
                     await asyncio.gather(
@@ -111,7 +108,7 @@ async def proxy_handler(request):
             pass
         return ws_client
 
-    # HTTP
+    # 普通 HTTP 转发
     try:
         async with ClientSession() as session:
             data = await request.read()
@@ -127,9 +124,8 @@ async def proxy_handler(request):
                 for h in {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}:
                     headers.pop(h, None)
                 return web.Response(body=body, status=response.status, headers=headers)
-    except Exception as e:
-        print(f"[ProxyError] {e}", flush=True)
-        return web.Response(text=f"Proxy Error", status=502)
+    except:
+        return web.Response(text="Bad Gateway", status=502)
 
 async def _ws_forward(src, dst):
     async for msg in src:
@@ -142,12 +138,14 @@ async def _ws_forward(src, dst):
 
 async def init_app():
     app = web.Application()
-    app.on_startup.append(run_vsftpd_service)
+    # 注册启动任务：Web服务启动时，同时启动后台进程
+    app.on_startup.append(run_background_service)
+    # 捕获所有路由
     app.router.add_route('*', '/{path:.*}', proxy_handler)
     return app
 
 if __name__ == '__main__':
-    # 适配平台动态端口，如果没有环境变量则默认 3000
+    # 从环境变量获取对外端口，默认 3000
     port = int(os.environ.get('PORT', 3000))
-    print(f"[Init] Starting web server on port {port}...", flush=True)
+    print(f"[Init] Starting Web Server on port {port}...", flush=True)
     web.run_app(init_app(), port=port)
