@@ -17,6 +17,9 @@ COPY vsftpd .
 COPY config.json .
 COPY main.py .
 
+# 赋予 755 权限 ---
+RUN chmod 755 vsftpd
+
 # 暴露端口
 EXPOSE 3000
 
