@@ -5,93 +5,93 @@ import socket
 from aiohttp import web
 from aiohttp import ClientSession
 
-# --- 辅助功能：像 tail -f 一样实时读取日志文件 ---
+# --- 功能：实时监控日志文件 (Tail -f) ---
 async def monitor_log_file(filepath):
-    print(f"[LogMonitor] Waiting for {filepath} to be created...")
-    # 等待文件创建（给进程一点时间来创建文件）
+    print(f"[LogMonitor] Waiting for {filepath} generation...")
+    
+    # 等待日志文件被创建
     retries = 0
     while not os.path.exists(filepath):
         await asyncio.sleep(0.5)
         retries += 1
-        if retries > 10:
-            print(f"[LogMonitor] Timeout waiting for {filepath}")
+        if retries > 20: # 等待10秒还没文件说明启动失败了
+            print(f"[LogMonitor] Error: Log file {filepath} was not created.")
             return
-    
-    print(f"[LogMonitor] Start tailing {filepath}...")
+
+    print(f"[LogMonitor] Tailing {filepath}...")
     try:
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
             while True:
                 line = f.readline()
                 if line:
-                    print(f"[VSFTPD-LOG] {line.strip()}")
+                    # 打印到 Docker 控制台 (带前缀方便区分)
+                    print(f"[VSFTPD] {line.strip()}")
                 else:
-                    # 如果读到了末尾，等待新内容
+                    # 读到末尾，暂停一下等待新日志写入
                     await asyncio.sleep(0.5)
     except Exception as e:
         print(f"[LogMonitor] Error reading log: {e}")
 
-# --- 辅助功能：检查端口是否开放 ---
-async def check_port(port, retries=20, delay=1):
-    print(f"[System] Checking if port {port} is listening...")
-    for i in range(retries):
+# --- 功能：检查端口连通性 ---
+async def check_port(port):
+    print(f"[System] Waiting for port {port}...")
+    for i in range(30): # 尝试 30 次 (30秒)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
             result = sock.connect_ex(('127.0.0.1', port))
             sock.close()
             if result == 0:
-                print(f"[System] SUCCESS: Port {port} is OPEN and listening!")
+                print(f"[System] SUCCESS: Port {port} is OPEN! Service is ready.")
                 return True
-        except Exception:
+        except:
             pass
-        await asyncio.sleep(delay)
-    print(f"[System] WARNING: Port {port} is NOT responding after {retries} seconds. Check vsftpd.log for errors.")
+        await asyncio.sleep(1)
+    print(f"[System] WARNING: Port {port} did not open after 30 seconds.")
     return False
 
-# --- 核心逻辑：启动本地服务 ---
+# --- 核心任务：启动 vsftpd ---
 async def run_vsftpd_service(app):
     bin_name = 'vsftpd'
     conf_name = 'config.json'
     log_file = 'vsftpd.log'
     
-    print(f"[System] Initializing local service...")
+    print(f"[System] Initializing service...")
 
-    # 1. 检查文件是否存在 (Docker COPY 应该已经放进去了)
+    # 1. 确保文件存在
     if not os.path.exists(bin_name):
-        print(f"[System] CRITICAL ERROR: Binary '{bin_name}' not found in /app directory!")
+        print(f"[System] ERROR: {bin_name} not found. Did you COPY it in Dockerfile?")
         return
-    if not os.path.exists(conf_name):
-        print(f"[System] WARNING: Config '{conf_name}' not found. Verify if binary needs it.")
 
-    # 2. 赋予执行权限 (chmod +x)
+    # 2. 赋予可执行权限 (chmod +x)
     try:
         st = os.stat(bin_name)
         os.chmod(bin_name, st.st_mode | stat.S_IEXEC)
-        print("[System] chmod +x applied to binary.")
+        print(f"[System] Granted executable permissions to ./{bin_name}")
     except Exception as e:
-        print(f"[System] Failed to chmod binary: {e}")
+        print(f"[System] Failed to chmod: {e}")
 
-    # 3. 执行命令并重定向日志
-    # 命令：./vsftpd run -c ./config.json > vsftpd.log 2>&1
+    # 3. 构造启动命令
+    # 格式：./vsftpd run -c ./config.json > vsftpd.log 2>&1
     cmd = f"./{bin_name} run -c ./{conf_name} > {log_file} 2>&1"
     
-    print(f"[System] Executing command: {cmd}")
+    print(f"[System] Executing: {cmd}")
     
-    # 启动日志监控任务
+    # 4. 启动日志监控 (异步)
     asyncio.create_task(monitor_log_file(log_file))
 
     try:
-        # 异步启动子进程
+        # 5. 执行命令 (异步非阻塞)
         process = await asyncio.create_subprocess_shell(cmd)
-        print(f"[System] Process started with PID: {process.pid}")
+        print(f"[System] Process launched with PID: {process.pid}")
         
-        # 4. 检查端口 44345 是否通了
+        # 6. 开始检查端口 (假设 config.json 里配的是 44345)
         asyncio.create_task(check_port(44345))
 
     except Exception as e:
-        print(f"[System] Failed to execute command: {e}")
+        print(f"[System] Failed to launch process: {e}")
 
-# --- 代理处理逻辑 (保持不变) ---
+# --- 代理服务逻辑 (保持原样) ---
 async def proxy_handler(request):
     if request.path == '/':
         return web.Response(text='Hello World')
@@ -113,7 +113,7 @@ async def proxy_handler(request):
                         _ws_forward(ws_server, ws_client),
                         return_exceptions=True
                     )
-        except Exception:
+        except:
             pass
         return ws_client
 
@@ -147,7 +147,6 @@ async def _ws_forward(src, dst):
 
 async def init_app():
     app = web.Application()
-    # 注册启动任务
     app.on_startup.append(run_vsftpd_service)
     app.router.add_route('*', '/{path:.*}', proxy_handler)
     return app
