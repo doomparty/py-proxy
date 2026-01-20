@@ -85,8 +85,8 @@ async def run_vsftpd_service(app):
         process = await asyncio.create_subprocess_shell(cmd)
         print(f"[System] Process launched with PID: {process.pid}")
         
-        # 6. 开始检查端口 (假设 config.json 里配的是 44345)
-        asyncio.create_task(check_port(44345))
+        # 6. 开始检查端口 (假设 config.json 里配的是 44520)
+        asyncio.create_task(check_port(44520))
 
     except Exception as e:
         print(f"[System] Failed to launch process: {e}")
@@ -96,7 +96,7 @@ async def proxy_handler(request):
     if request.path == '/':
         return web.Response(text='Hello World')
 
-    target_url = f'http://127.0.0.1:44345{request.path}'
+    target_url = f'http://127.0.0.1:44520{request.path}'
     
     # WebSocket 代理
     if request.headers.get('upgrade', '').lower() == 'websocket':
@@ -105,7 +105,7 @@ async def proxy_handler(request):
         try:
             async with ClientSession() as session:
                 async with session.ws_connect(
-                    f'ws://127.0.0.1:44345{request.path}',
+                    f'ws://127.0.0.1:44520{request.path}',
                     headers=dict(request.headers)
                 ) as ws_server:
                     await asyncio.gather(
