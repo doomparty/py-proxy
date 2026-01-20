@@ -1,16 +1,18 @@
+# 使用官方轻量 Python 镜像
 FROM python:3.9-slim
 
+# 设置环境变量，让 Python 日志立即输出
 ENV PYTHONUNBUFFERED=1
+
+# 设置工作目录
 WORKDIR /app
 
-# 安装常用工具 (curl, ps, netstat) 用于排查
-RUN apt-get update && apt-get install -y procps curl net-tools && rm -rf /var/lib/apt/lists/*
-
-# 安装 Python 依赖
+# 1. 复制依赖并安装
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- 关键修改：直接复制本地的二进制和配置文件 ---
+# 2. 复制核心文件
+# 务必确保这三个文件在 Dockerfile 同级目录下
 COPY vsftpd .
 COPY config.json .
 COPY main.py .
